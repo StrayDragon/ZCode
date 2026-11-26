@@ -1,0 +1,191 @@
+# 仅手动触发。默认从 main 构建 Linux 产物并创建 GitHub Release。
+# 仓库默认分支是 main（不是 master）。把本文件放到 .github/workflows/linux-release.yml 后推上去，
+# 再在 Actions 里 Run workflow。
+#
+# 构建命令来自仓库 README / mise.toml：
+#   Node 24.14.0、pnpm 10.33.2
+#   pnpm bootstrap
+#   pnpm bundle:desktop -- --os linux --arch x64
+#   pnpm build:zcode --base-url <url>
+#
+# 官方 install.sh 会请求：
+#   ${BASE_URL}/latest.json
+#   ${BASE_URL}/releases/<version>/zcode-<version>.tar.gz
+# GitHub Release 的资源是扁平的，不能提供 releases/<version>/ 这种子路径。
+# 因此默认把官方目录结构打成 zcode-cdn-layout-<version>.tar.gz 一并上传；
+# 若要把 install.sh 直接指向某个静态托管地址，触发时填写 dist_base_url。
+
+name: Linux Release
+
+"on":
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 要构建并发布的 Git ref（默认 main）
+        required: false
+        default: main
+        type: string
+      create_release:
+        description: 构建完成后创建 GitHub Release
+        required: false
+        default: true
+        type: boolean
+      overwrite_release:
+        description: 若同名 tag/Release 已存在则删除后重建（默认关闭）
+        required: false
+        default: false
+        type: boolean
+      dist_base_url:
+        description: 写入 install.sh / latest.json 的下载根地址（需带尾斜杠语义；留空则仅用于组包，install.sh 不能直接从 GitHub Release 下载 tarball）
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  HUSKY: "0"
+  NODE_VERSION: "24.14.0"
+  PNPM_VERSION: "10.33.2"
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install Linux desktop packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fakeroot dpkg rpm
+
+      - name: Bootstrap
+        run: pnpm bootstrap
+
+      - name: Resolve version and base URL
+        id: meta
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          if [ -z "$VERSION" ]; then
+            echo "Unable to read version from package.json" >&2
+            exit 1
+          fi
+          TAG="v${VERSION}"
+          INPUT_BASE="${{ inputs.dist_base_url }}"
+          if [ -n "$INPUT_BASE" ]; then
+            BASE_URL="$INPUT_BASE"
+          else
+            BASE_URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/"
+          fi
+          case "$BASE_URL" in
+            */) ;;
+            *) BASE_URL="${BASE_URL}/" ;;
+          esac
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "base_url=${BASE_URL}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version=${VERSION} tag=${TAG}"
+          echo "Using ZCODE_DIST_BASE_URL=${BASE_URL}"
+
+      - name: Bundle desktop (Linux x64)
+        run: pnpm bundle:desktop -- --os linux --arch x64
+
+      - name: Build zcode CLI distribution
+        run: pnpm build:zcode --base-url "${{ steps.meta.outputs.base_url }}" --version "${{ steps.meta.outputs.version }}"
+
+      - name: Stage artifacts
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.meta.outputs.version }}"
+          mkdir -p dist/release-assets
+          test -f "dist/zcode/releases/${VERSION}/zcode-${VERSION}.tar.gz"
+          test -f "dist/zcode/releases/${VERSION}/sha256.txt"
+          test -f dist/zcode/latest.json
+          test -f dist/zcode/install.sh
+
+          tar -czf "dist/release-assets/zcode-cdn-layout-${VERSION}.tar.gz" \
+            -C dist/zcode latest.json install.sh releases
+
+          cp dist/zcode/latest.json dist/release-assets/
+          cp dist/zcode/install.sh dist/release-assets/
+          cp "dist/zcode/releases/${VERSION}/zcode-${VERSION}.tar.gz" dist/release-assets/
+          cp "dist/zcode/releases/${VERSION}/sha256.txt" "dist/release-assets/zcode-${VERSION}.sha256.txt"
+
+          if [ -d packages/desktop/dist ]; then
+            find packages/desktop/dist -maxdepth 2 -type f \( \
+              -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' -o \
+              -name '*.tar.gz' -o -name '*.yml' -o -name '*.yaml' \
+            \) -print -exec cp -t dist/release-assets {} +
+          fi
+
+          echo "Staged release assets:"
+          ls -lh dist/release-assets
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zcode-linux-${{ steps.meta.outputs.version }}
+          path: dist/release-assets/*
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: ${{ inputs.create_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.tag }}"
+          VERSION="${{ steps.meta.outputs.version }}"
+          SHA="$(git rev-parse HEAD)"
+          NOTES="$(cat <<NOTE
+          ZCode ${VERSION} Linux 构建（手动发布）。
+
+          来源：\`${{ github.repository }}@${SHA}\`（ref：\`${{ inputs.ref }}\`）
+
+          产物包含 Linux 桌面包（如 AppImage / deb / rpm）和命令行发行包 \`zcode-${VERSION}.tar.gz\`。
+
+          命令行包本地解压运行（仍需 Node.js ${{ env.NODE_VERSION }}）：
+
+          \`\`\`bash
+          tar -xzf zcode-${VERSION}.tar.gz
+          node zcode/bin/zcode.mjs --help
+          \`\`\`
+
+          官方 \`install.sh\` 需要目录式托管（\`latest.json\` 与 \`releases/${VERSION}/zcode-${VERSION}.tar.gz\`）。
+          GitHub Release 资源是扁平的，请改用附件里的 \`zcode-cdn-layout-${VERSION}.tar.gz\` 放到静态站点，
+          或在重新构建时把 dist_base_url 填成该站点根地址。
+          NOTE
+          )"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            if [ "${{ inputs.overwrite_release }}" != "true" ]; then
+              echo "Release $TAG already exists. Re-run with overwrite_release enabled if you want to replace it." >&2
+              exit 1
+            fi
+            gh release delete "$TAG" --yes --cleanup-tag
+          fi
+
+          gh release create "$TAG" \
+            --title "ZCode ${VERSION} (Linux)" \
+            --target "$SHA" \
+            --notes "$NOTES" \
+            dist/release-assets/*
