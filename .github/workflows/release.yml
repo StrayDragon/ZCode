@@ -75,7 +75,7 @@ jobs:
       - name: Install Linux desktop packaging tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends fakeroot dpkg rpm
+          sudo apt-get install -y --no-install-recommends fakeroot dpkg rpm libarchive-tools
 
       - name: Bootstrap
         run: pnpm bootstrap
