@@ -1,5 +1,5 @@
 # 仅手动触发。默认从 main 构建 Linux 产物并创建 GitHub Release。
-# 仓库默认分支是 main（不是 master）。把本文件放到 .github/workflows/linux-release.yml 后推上去，
+# 仓库默认分支是 main（不是 master）。把本文件放到 .github/workflows/release.yml 后推上去，
 # 再在 Actions 里 Run workflow。
 #
 # 构建命令来自仓库 README / mise.toml：
@@ -7,6 +7,9 @@
 #   pnpm bootstrap
 #   pnpm bundle:desktop -- --os linux --arch x64
 #   pnpm build:zcode --base-url <url>
+#
+# Linux 桌面只打 AppImage（构建前把 electron-builder 的 linux.target 收窄为 AppImage），
+# 因此不安装 fakeroot/dpkg/rpm/libarchive-tools。命令行发行包仍会构建。
 #
 # 官方 install.sh 会请求：
 #   ${BASE_URL}/latest.json
@@ -72,11 +75,6 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
 
-      - name: Install Linux desktop packaging tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends fakeroot dpkg rpm libarchive-tools
-
       - name: Bootstrap
         run: pnpm bootstrap
 
@@ -106,6 +104,20 @@ jobs:
           echo "Resolved version=${VERSION} tag=${TAG}"
           echo "Using ZCODE_DIST_BASE_URL=${BASE_URL}"
 
+      - name: Limit Linux desktop targets to AppImage
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("packages/desktop/electron-builder.config.js")
+          text = p.read_text()
+          old = 'target: ["AppImage", "deb", "rpm", "pacman"]'
+          new = 'target: ["AppImage"]'
+          if old not in text:
+              raise SystemExit("linux.target 不是预期写法，拒绝继续，避免打出完整四件套")
+          p.write_text(text.replace(old, new, 1))
+          print("linux.target -> [AppImage]")
+          PY
+
       - name: Bundle desktop (Linux x64)
         run: pnpm bundle:desktop -- --os linux --arch x64
 
@@ -113,7 +125,7 @@ jobs:
         run: |
           pnpm build:sea:prepare
           pnpm build:zcode --base-url "${{ steps.meta.outputs.base_url }}" --version "${{ steps.meta.outputs.version }}"
-          
+
       - name: Stage artifacts
         run: |
           set -euo pipefail
@@ -134,8 +146,7 @@ jobs:
 
           if [ -d packages/desktop/dist ]; then
             find packages/desktop/dist -maxdepth 2 -type f \( \
-              -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' -o \
-              -name '*.tar.gz' -o -name '*.yml' -o -name '*.yaml' \
+              -name '*.AppImage' -o -name 'latest-linux.yml' \
             \) -print -exec cp -t dist/release-assets {} +
           fi
 
@@ -163,7 +174,7 @@ jobs:
 
           来源：\`${{ github.repository }}@${SHA}\`（ref：\`${{ inputs.ref }}\`）
 
-          产物包含 Linux 桌面包（如 AppImage / deb / rpm）和命令行发行包 \`zcode-${VERSION}.tar.gz\`。
+          产物包含 Linux 桌面 AppImage 和命令行发行包 \`zcode-${VERSION}.tar.gz\`。
 
           命令行包本地解压运行（仍需 Node.js ${{ env.NODE_VERSION }}）：
 
