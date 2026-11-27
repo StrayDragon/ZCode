@@ -110,8 +110,10 @@ jobs:
         run: pnpm bundle:desktop -- --os linux --arch x64
 
       - name: Build zcode CLI distribution
-        run: pnpm build:zcode --base-url "${{ steps.meta.outputs.base_url }}" --version "${{ steps.meta.outputs.version }}"
-
+        run: |
+          pnpm build:sea:prepare
+          pnpm build:zcode --base-url "${{ steps.meta.outputs.base_url }}" --version "${{ steps.meta.outputs.version }}"
+          
       - name: Stage artifacts
         run: |
           set -euo pipefail
